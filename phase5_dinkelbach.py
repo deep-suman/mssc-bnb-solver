@@ -114,7 +114,7 @@ def solve_01qp(Q: np.ndarray, L: np.ndarray,
     m        = len(L)
     L_shifted = L - q      # absorb the -q*D(v) term into linear coefficients
 
-    if m <= 20:
+    if m <= 18:
         return _solve_01qp_exhaustive(Q, L_shifted, m)
     else:
         return _solve_01qp_local_search(Q, L_shifted, m)
@@ -122,18 +122,14 @@ def solve_01qp(Q: np.ndarray, L: np.ndarray,
 
 def _solve_01qp_exhaustive(Q: np.ndarray, L: np.ndarray,
                             m: int) -> Tuple[np.ndarray, float]:
-    """Exact solver by enumeration of all 2^m binary vectors."""
-    best_v   = np.zeros(m)
-    best_obj = 0.0          # v=0 gives obj=0 (empty cluster, invalid)
-
-    for bits in range(1, 2**m):   # skip v=0 (empty)
-        v = np.array([(bits >> b) & 1 for b in range(m)], dtype=float)
-        obj = 0.5 * float(v @ Q @ v) + float(L @ v)
-        if obj < best_obj:
-            best_obj = obj
-            best_v   = v.copy()
-
-    return best_v, best_obj
+    """Exact solver: vectorized enumeration of all 2^m binary vectors."""
+    bits = np.arange(1, 2**m, dtype=np.int32)                          # (2^m-1,)
+    V = ((bits[:, None] >> np.arange(m, dtype=np.int32)) & 1).astype(np.float64)  # (2^m-1, m)
+    objs = 0.5 * (V * (V @ Q)).sum(axis=1) + V @ L                    # (2^m-1,)
+    best = int(objs.argmin())
+    if objs[best] >= 0.0:
+        return np.zeros(m), 0.0
+    return V[best], float(objs[best])
 
 
 def _solve_01qp_local_search(Q: np.ndarray, L: np.ndarray,
