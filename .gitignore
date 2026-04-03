@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+gurobi.log
+*.lp
+*.mps
+check_*.py
+debug_*.py
+test_*.py
+get_ruspini_*.py
+find_body_cols.py
+scratch_*.py
+tmp_*.py
+.idea/
+.vscode/
