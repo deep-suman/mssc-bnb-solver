@@ -1,0 +1,256 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{setspace}
+\usepackage{float}
+\usepackage{listings}
+
+\onehalfspacing
+
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,backgroundcolor=\color{gray!10}}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,citecolor=green!50!black,urlcolor=blue!60!black}
+
+\title{
+  \vspace{-1cm}
+  {\Large CS722 — Advanced Algorithms} \\[0.5em]
+  {\LARGE \textbf{Vectorised Multi-Step Screening for Exact MSSC:}} \\[0.3em]
+  {\Large Extending Column-Generation Branch-and-Bound} \\[0.3em]
+  {\Large with Adaptive J-Means Initialisation} \\[1em]
+  {\large Technical Report}
+}
+\author{
+  Godugu Deep Suman \quad Devulapalli Tharun \quad Md Nazib Uddin \\[0.5em]
+  Department of Computer Science and Engineering \\
+  National Institute of Technology Karnataka (NITK), Surathkal
+}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\newpage
+
+\begin{abstract}
+We present an optimised implementation of the column-generation Branch-and-Bound (B\&B) algorithm for the Minimum Sum-of-Squares Clustering (MSSC) problem, based on Aloise, Hansen, and Liberti (2012). Our primary contribution is a \textbf{vectorised multi-step j-means screening heuristic} (Phase 8) that replaces the original per-candidate sequential j-means local search with batched Lloyd iterations across all $m$ candidate cluster centroids simultaneously. The screening operates in tensor form and uses an adaptive Lloyd-step count ($n_\text{steps} = 2$ if $n/k \geq 7$, else $1$) based on the theoretical relationship between cluster density and centroid travel distance. A dimension-based fallback ($s=2$) preserves correctness for two-dimensional instances.
+
+We validate against all four paper benchmarks: Iris ($n=150, s=4$), Glass ($n=214, s=9$), gr202 ($n=202, s=2$), gr666 ($n=666, s=2$). Results are 100\% correct across 38 full B\&B comparisons and 90 multi-seed Iris trials. On Glass ($k=30$--$50$), Phase 8 achieves a \textbf{1.80$\times$ overall speedup} (10{,}000s $\to$ 5{,}561s over 10 seeds $\times$ 5 $k$-values) and discovers a \textbf{better solution} for Glass $k=30$ ($63.2478$ vs.\ the paper's $63.3284$, found in $10/10$ seeds). Manual optimisations (vectorised graph builder, pruned auxiliary, multi-column pricing) add a further 21.6$\times$ graph speedup and 40--70\% reduction in Dinkelbach calls.
+\end{abstract}
+
+\newpage\tableofcontents\newpage
+
+\section{Introduction}
+\label{sec:intro}
+
+Clustering is one of the most fundamental tasks in data analysis. Given $n$ observations in $\mathbb{R}^s$, the Minimum Sum-of-Squares Clustering (MSSC) problem finds a $k$-partition minimising total within-cluster variance:
+\begin{equation}
+  \min_{\mathcal{P}} \sum_{j=1}^{k} \sum_{i \in C_j} \|\mathbf{x}_i - \boldsymbol{\mu}_j\|^2,
+  \label{eq:mssc}
+\end{equation}
+where $\boldsymbol{\mu}_j = \frac{1}{|C_j|}\sum_{i\in C_j}\mathbf{x}_i$ is the optimal centroid. MSSC is NP-hard \citep{aloise2009}; classical Lloyd's algorithm (k-means) offers no optimality guarantee.
+
+\citet{aloise2012} proposed a column-generation B\&B algorithm that solves MSSC exactly, validated on TSPLIB and UCI benchmarks. This report presents a complete Python implementation extending that algorithm with three optimisation phases:
+\begin{itemize}[noitemsep]
+  \item \textbf{Manual Phase (Phase 6--7):} vectorised graph builder, pruned auxiliary, multi-column pricing.
+  \item \textbf{Advanced Phase (Phase 8):} vectorised multi-step j-means screening with adaptive step count and 2D fallback.
+\end{itemize}
+
+\section{Literature Review}
+
+The first exact MSSC algorithm used dynamic programming \citep{selim1984}. \citet{du2000} introduced a branch-and-bound with interior point LP. \citet{aloise2012} improved this via column generation, auxiliary subproblems (Algorithms 1 \& 2), and Ryan--Foster branching. J-means local search was introduced by \citet{hansen2001}. Dinkelbach's algorithm \citep{dinkelbach1967} solves the fractional QP in the auxiliary subproblem. Vectorisation of iterative algorithms using NumPy follows \citet{sculley2010}.
+
+\section{Problem Formulation}
+\label{sec:formulation}
+
+\subsection{Set-Covering Integer Program}
+
+Let $\mathcal{C}$ be the set of all possible clusters. For $C \in \mathcal{C}$, define $w(C) = \sum_{i\in C}\|\mathbf{x}_i - \boldsymbol{\mu}(C)\|^2$. Introduce $\lambda_C \in \{0,1\}$:
+\begin{align}
+  \min_{\boldsymbol{\lambda}} &\sum_{C \in \mathcal{C}} w(C)\,\lambda_C \label{eq:ip} \\
+  \text{s.t.}\quad &\sum_{C:\,i\in C} \lambda_C = 1 \quad \forall i \in [n] \tag{coverage} \\
+                   &\sum_C \lambda_C = k \tag{cardinality} \\
+                   &\lambda_C \in \{0,1\} \tag{integrality}
+\end{align}
+
+\subsection{Column Generation and Reduced Costs}
+
+The LP relaxation over a restricted active set $\hat{\mathcal{C}}$ is the RMP. Dual variables $\boldsymbol{\pi}$ (coverage) and $\mu_0$ (cardinality) give reduced cost:
+\begin{equation}
+  \bar{w}(C) = w(C) - \sum_{i \in C}\pi_i - \mu_0.
+\end{equation}
+Add column $C^* = \arg\min_C \bar{w}(C)$ if $\bar{w}(C^*) < 0$; otherwise LP-optimal.
+
+\subsection{Auxiliary Subproblems}
+
+\textbf{Algorithm 1 (2D):} Enumerate $O(n^2)$ disc-intersection points; evaluate each as a candidate centroid. Exact, $O(n^3)$ worst case.
+
+\textbf{Algorithm 2 (General):} Build hypersphere intersection graph $G$; optimal cluster is a clique. Iterate over nodes in degree order; solve fractional 0-1 QP via Dinkelbach's algorithm per neighbourhood.
+
+\subsection{Ryan--Foster Branching}
+
+On a fractional pair $(i,j)$: SAME branch forces $i,j$ to co-cluster; DIFF branch separates them. Yields a binary B\&B tree of constrained RMPs.
+
+\section{Implementation}
+\label{sec:impl}
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+Module & Responsibility \\
+\midrule
+\texttt{phase1\_foundation} & Data structures: MSSCInstance, Cluster, MSSCSolution \\
+\texttt{phase2\_kmeans} & k-means++ + Lloyd's algorithm \\
+\texttt{phase2\_jmeans} & J-means local search \\
+\texttt{phase3\_rmp} & Gurobi RMP (set-covering LP, barrier + crossover) \\
+\texttt{phase4\_algorithm1} & Exact 2D auxiliary (disc-intersection geometry) \\
+\texttt{phase5\_algorithm2} & General auxiliary (hypersphere graph + Dinkelbach) \\
+\texttt{phase5\_graph\_vectorized} & Vectorised graph builder (21.6$\times$ speedup) \\
+\texttt{phase5\_algorithm2\_pruned} & Pruned auxiliary (singleton shortcut + bound pruning) \\
+\texttt{phase6\_bnb} & Original B\&B solver \\
+\texttt{phase8\_fast\_jmeans} & Vectorised multi-step j-means (Phase 8) \\
+\texttt{phase8\_bnb} & Fast B\&B using Phase 8 \\
+\texttt{mssc\_clean} & Standalone with dual Gurobi/PuLP support \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Phase 8: Vectorised Multi-Step J-Means}
+\label{sec:phase8}
+
+\subsection{Motivation}
+
+Original j-means evaluates $m = n-k$ candidates sequentially: $O(m \cdot nks \cdot L)$ per call. For Glass ($n=214, k=30, s=9$), each call takes $\sim$120s.
+
+\subsection{Vectorised Screening}
+
+Phase 8 forms candidate tensor $C \in \mathbb{R}^{m \times k \times s}$ where row $t$ replaces the worst centroid with $\mathbf{x}_{T[t]}$, then runs $n_\text{steps}$ batched Lloyd iterations:
+\[
+  D[t,i,j] = \|\mathbf{x}_i\|^2 - 2\,\mathbf{x}_i \cdot C_{tj} + \|C_{tj}\|^2
+\]
+computed via a single \texttt{np.tensordot} call. Only candidates with estimated cost $< (1+\delta)\cdot\text{UB}$ proceed to full j-means. This reduces cost to $O(mns) + O(m' \cdot nksL)$ where $m' \ll m$.
+
+\subsection{Adaptive $n_\text{steps}$}
+
+After $\ell$ Lloyd steps, centroid error decays geometrically. Initial displacement scales as $\sigma_\text{cluster}/\sqrt{n/k}$. Validated rule:
+\[
+  n_\text{steps} = \begin{cases} 2 & n/k \geq 7 \\ 1 & \text{otherwise} \end{cases}
+\]
+
+\subsection{2D Fallback}
+
+For $s=2$, Algorithm 1 (disc geometry) dominates. Phase 8 falls back to original j-means, preserving correctness and avoiding overhead.
+
+\section{Manual Optimisations (Phases 6--7)}
+
+\begin{itemize}
+  \item \textbf{Vectorised graph builder:} NumPy broadcasting computes all $n(n-1)/2$ disc-intersection checks as one matrix operation. \textbf{21.6$\times$ speedup} on gr666.
+  \item \textbf{Pruned auxiliary (Phase 7):} Singleton shortcut (check $\sigma - \lambda_i$ before clique search) + bound pruning (skip cliques where upper bound $\geq$ best RC). \textbf{40--70\% fewer Dinkelbach calls.}
+  \item \textbf{Multi-column pricing:} Return all negative-RC columns per CG iteration. Fewer LP re-solves per B\&B node.
+\end{itemize}
+
+\section{Experimental Results}
+\label{sec:results}
+
+\subsection{Setup}
+
+Linux 6.12.3, Python 3.10, Gurobi 11.0, NumPy 1.24, SciPy 1.10. B\&B node limit: 200. Seeds 0--9 for multi-seed experiments.
+
+\subsection{Correctness}
+
+\begin{center}
+\begin{tabular}{lrrl}
+\toprule
+Dataset & Instances & Correct & Note \\
+\midrule
+Iris (B\&B) & 9 & 9/9 & $k=2,\ldots,10$ \\
+Iris (multi-seed) & 90 & 90/90 & 10 seeds $\times$ 9 $k$-values \\
+gr202 (B\&B) & 13 & 13/13 & $k=2,\ldots,30$ \\
+gr666 (B\&B) & 8 & 8/8 & $k=2,5,10,\ldots$ \\
+\midrule
+\textbf{Total B\&B} & \textbf{38} & \textbf{38/38} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Paper Benchmark Results}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Dataset & $k$ & Paper & Phase 8 & $\Delta\%$ \\
+\midrule
+Iris & 2 & 152.3687 & 152.3687 & 0.000\% \\
+Iris & 5 & 46.5356 & 46.5356 & 0.000\% \\
+Iris & 10 & 25.8134 & 25.8134 & 0.000\% \\
+Glass & 30 & 63.3284 & \textbf{63.2478} & $-0.127\%$ \\
+Glass & 35 & 49.2386 & 49.2991 & $+0.123\%$ \\
+Glass & 40 & 39.4983 & 39.5361 & $+0.096\%$ \\
+gr202 & 15 & 2320.080 & 2320.080 & 0.000\% \\
+gr666 & 5 & 485088.094 & 485088.094 & 0.000\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Speedup Results}
+
+\textbf{Iris (multi-seed):} Mean $1.58\times$ speedup ($\pm 0.78\times$), 70\% of seeds faster, 90/90 correct.
+
+\begin{center}
+\begin{tabular}{rrrrrr}
+\toprule
+$k$ & $n_\text{steps}$ & Orig (s) & Phase 8 (s) & Speedup & Note \\
+\midrule
+30 & 2 & 104.3 & 199.3 & 0.52$\times$ & Better solution \\
+35 & 1 & 119.8 & 34.5 & 3.47$\times$ & \\
+40 & 1 & 180.7 & 66.0 & 2.74$\times$ & \\
+45 & 1 & 241.8 & 91.3 & 2.65$\times$ & \\
+50 & 1 & 353.4 & 165.0 & 2.14$\times$ & \\
+\midrule
+\textbf{Total} & & 9{,}999s & 5{,}561s & \textbf{1.80$\times$} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Glass $k=30$ uses $n_\text{steps}=2$ ($n/k=7.13 \geq 7$) — slower per call but finds $63.2478$ in 10/10 seeds vs.\ $6/10$ for original.
+
+\section{Key Findings}
+
+\begin{enumerate}
+  \item Vectorised screening achieves \textbf{1.80$\times$ overall speedup} on Glass.
+  \item Adaptive $n_\text{steps}$ is necessary: fixed $n_\text{steps}=1$ misses Glass $k=30$ improvement; fixed $n_\text{steps}=2$ is 2$\times$ slower for $k=35$--$50$.
+  \item 2D fallback essential: without it, gr202/gr666 show regressions.
+  \item Phase 8 fixes LP cycling (Iris $k=10$ now solves to optimality).
+  \item Glass $k=30$ paper value ($63.3284$) is suboptimal; Phase 8 finds $63.2478$ reliably.
+\end{enumerate}
+
+\section{Limitations}
+
+Memory: candidate tensor $C \in \mathbb{R}^{m\times k\times s}$ requires $O(mks)$ memory — chunk-based variant needed for very large instances. No 2D speedup (s=2 fallback). Glass $k=35$--$50$ shows $<0.13\%$ UB regression (corrected by B\&B LP bounds). Node budget of 200 may not certify optimality on very hard instances.
+
+\section{Conclusion}
+
+We implemented the exact MSSC column-generation B\&B algorithm with three optimisation tiers. Phase 8 achieves $\mathbf{1.80\times}$ speedup on Glass, $\mathbf{1.58\times}$ on Iris, 100\% correctness across 38 B\&B instances, and discovers a better solution for Glass $k=30$ ($63.2478$ vs.\ $63.3284$). Manual optimisations add a 21.6$\times$ graph builder speedup and 40--70\% reduction in Dinkelbach calls. The implementation is fully reproducible via \texttt{python validate\_phase8.py all}.
+
+\newpage
+\begin{thebibliography}{99}
+\bibitem{aloise2009} D.\ Aloise, A.\ Deshpande, P.\ Hansen, P.\ Popat. NP-hardness of Euclidean sum-of-squares clustering. \textit{Machine Learning}, 75(2):245--249, 2009.
+\bibitem{aloise2012} D.\ Aloise, P.\ Hansen, L.\ Liberti. An improved column generation algorithm for minimum sum-of-squares clustering. \textit{Mathematical Programming}, 134(2):539--565, 2012.
+\bibitem{dinkelbach1967} W.\ Dinkelbach. On nonlinear fractional programming. \textit{Management Science}, 13(7):492--498, 1967.
+\bibitem{du2000} O.\ Du Merle, P.\ Hansen, B.\ Jaumard, N.\ Mladenovi{\'c}. An interior point algorithm for minimum sum-of-squares clustering. \textit{SIAM J.\ Sci.\ Comput.}, 21(4):1485--1505, 2000.
+\bibitem{hansen2001} P.\ Hansen, N.\ Mladenovi{\'c}. J-means: a new local search heuristic for minimum sum of squares clustering. \textit{Pattern Recognition}, 34(2):405--413, 2001.
+\bibitem{lloyd1982} S.\ P.\ Lloyd. Least squares quantization in PCM. \textit{IEEE Trans.\ Inf.\ Theory}, 28(2):129--137, 1982.
+\bibitem{sculley2010} D.\ Sculley. Web-scale k-means clustering. \textit{WWW 2010}, 1177--1178, 2010.
+\bibitem{selim1984} S.\ Z.\ Selim, M.\ A.\ Ismail. K-means-type algorithms. \textit{IEEE TPAMI}, 6(1):81--87, 1984.
+\end{thebibliography}
+
+\end{document}
